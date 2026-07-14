@@ -64,6 +64,23 @@ checks and reports effective runtime identities. Add `--pull` to verify
 availability and inspect those images with your local container runtime and
 registry credentials; the REANA server does not contact image registries.
 
+### Authentication
+
+Authenticate against a REANA deployment using the browser-based OIDC flow:
+
+```console
+$ reana-client-go login --server-url https://reana.example.org
+```
+
+The client stores renewable OIDC credentials in the shared REANA client
+configuration. Use `reana-client-go logout` to revoke and remove them. The
+`--access-token` option remains available as an explicit per-command override.
+
+TLS certificate verification is enabled by default. Private deployments can set
+`REANA_SERVER_CA_CERTS` to a PEM CA bundle. `REANA_INSECURE=true` disables
+verification only when no CA bundle is configured and should be limited to local
+testing.
+
 ## Shell completion
 
 The `reana-client-go` supports shell completion for Bash and Zsh. To enable the

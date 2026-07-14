@@ -36,7 +36,7 @@ func TestOpen(t *testing.T) {
 			args: []string{"-w", workflowName},
 			expected: []string{
 				"Interactive session opened successfully",
-				"/test/jupyter?token=1234",
+				"/test/jupyter?token=session-secret",
 				"It could take several minutes to start the interactive session.",
 				"Please note that it will be automatically closed after 7 days of inactivity.",
 			},
@@ -55,7 +55,7 @@ func TestOpen(t *testing.T) {
 			args: []string{"-w", workflowName},
 			expected: []string{
 				"Interactive session opened successfully",
-				"/test/jupyter?token=1234",
+				"/test/jupyter?token=session-secret",
 				"It could take several minutes to start the interactive session.",
 			},
 		},
@@ -73,7 +73,7 @@ func TestOpen(t *testing.T) {
 			args: []string{"-w", workflowName},
 			expected: []string{
 				"Interactive session opened successfully",
-				"/test/jupyter?token=1234",
+				"/test/jupyter?token=session-secret",
 				"It could take several minutes to start the interactive session.",
 			},
 		},
@@ -91,7 +91,7 @@ func TestOpen(t *testing.T) {
 			args: []string{"-w", workflowName, "-i", "image", "jupyter"},
 			expected: []string{
 				"Interactive session opened successfully",
-				"/test/jupyter?token=1234",
+				"/test/jupyter?token=session-secret",
 				"It could take several minutes to start the interactive session.",
 				"Please note that it will be automatically closed after 7 days of inactivity.",
 			},

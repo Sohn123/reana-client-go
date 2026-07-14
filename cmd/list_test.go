@@ -50,8 +50,8 @@ func TestList(t *testing.T) {
 			args: []string{"-s"},
 			expected: []string{
 				"NAME", "RUN_NUMBER", "CREATED", "SESSION_TYPE", "SESSION_URI", "SESSION_STATUS",
-				"my_workflow", "23", "2022-07-28T12:04:37", "jupyter", "/session1uri", "created",
-				"my_workflow2", "12", "2022-08-10T17:14:12", "/session2uri",
+				"my_workflow", "23", "2022-07-28T12:04:37", "jupyter", "/session1uri?token=session-secret", "created",
+				"my_workflow2", "12", "2022-08-10T17:14:12", "/session2uri?token=session-secret",
 			},
 			unwanted: []string{
 				"ID", "USER", "SIZE", "PROGRESS", "DURATION",
