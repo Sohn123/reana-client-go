@@ -121,6 +121,9 @@ func TestNormalizeServerURL(t *testing.T) {
 		{"reana.example.org/", "https://reana.example.org"},
 		{"https://reana.example.org/base/", "https://reana.example.org/base"},
 		{"http://127.0.0.1:5000/", "http://127.0.0.1:5000"},
+		// DNS hostnames are case-insensitive; two URLs differing only in host
+		// casing must normalize to the same credential-store key.
+		{"https://REANA.example.org/", "https://reana.example.org"},
 	} {
 		got, err := NormalizeServerURL(test.input)
 		if err != nil || got != test.want {

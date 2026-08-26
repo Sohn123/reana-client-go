@@ -43,6 +43,11 @@ func NormalizeServerURL(serverURL string) (string, error) {
 		return "", errors.New("REANA server URL must include scheme and host")
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	// DNS hostnames are case-insensitive; without this, two otherwise-
+	// identical server URLs differing only in host casing would normalize
+	// to different credential-store keys instead of being recognized as
+	// the same server.
+	parsed.Host = strings.ToLower(parsed.Host)
 	if parsed.Scheme != "https" {
 		host := parsed.Hostname()
 		ip := net.ParseIP(host)
