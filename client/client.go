@@ -245,16 +245,6 @@ func newAPIClient(
 	if err != nil {
 		return nil, err
 	}
-	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) > 0 && via[0].URL.Scheme == "https" &&
-			req.URL.Scheme != "https" {
-			return errors.New("refusing to follow an HTTPS-to-HTTP redirect")
-		}
-		if err := validateBearerTransportURL(req.URL); err != nil {
-			return fmt.Errorf("refusing REANA server redirect: %w", err)
-		}
-		return nil
-	}
 	tokenProvider := func(ctx context.Context) (string, error) {
 		return AccessToken(ctx, token)
 	}

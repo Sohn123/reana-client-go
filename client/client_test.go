@@ -94,7 +94,7 @@ func TestAPIClientRejectsBearerOverNonLoopbackHTTP(t *testing.T) {
 	}
 }
 
-func TestAPIClientRejectsHTTPSDowngradeRedirect(t *testing.T) {
+func TestAPIClientRejectsAllRedirects(t *testing.T) {
 	setServerURL(t, "https://reana.example")
 	api, err := ApiClient("jwt")
 	if err != nil {
@@ -112,8 +112,47 @@ func TestAPIClientRejectsHTTPSDowngradeRedirect(t *testing.T) {
 		nil,
 	)
 	err = api.httpClient.CheckRedirect(redirect, []*http.Request{original})
-	if err == nil || !strings.Contains(err.Error(), "HTTPS-to-HTTP") {
-		t.Fatalf("expected downgrade redirect rejection, got %v", err)
+	if err != http.ErrUseLastResponse {
+		t.Fatalf("redirect policy error = %v, want ErrUseLastResponse", err)
+	}
+}
+
+func TestAPIClientDoesNotReplayBearerAcrossRedirect(t *testing.T) {
+	targetRequests := 0
+	target := httptest.NewTLSServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			targetRequests++
+			if authorization := r.Header.Get("Authorization"); authorization != "" {
+				t.Errorf(
+					"redirect target received Authorization %q",
+					authorization,
+				)
+			}
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+	defer target.Close()
+	origin := httptest.NewTLSServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(
+				w,
+				r,
+				target.URL+"/captured",
+				http.StatusTemporaryRedirect,
+			)
+		},
+	))
+	defer origin.Close()
+	setServerURL(t, origin.URL)
+	t.Setenv("REANA_INSECURE", "true")
+
+	api, err := ApiClient("jwt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = api.Operations.GetYou(operations.NewGetYouParams(), nil)
+	if targetRequests != 0 {
+		t.Fatalf("redirect target received %d requests", targetRequests)
 	}
 }
 
