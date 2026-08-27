@@ -49,6 +49,12 @@ func (o *BffLogoutReader) ReadResponse(response runtime.ClientResponse, consumer
 			return nil, err
 		}
 		return nil, result
+	case 500:
+		result := NewBffLogoutInternalServerError()
+		if err := result.readResponse(response, consumer, o.formats); err != nil {
+			return nil, err
+		}
+		return nil, result
 	case 503:
 		result := NewBffLogoutServiceUnavailable()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
@@ -298,6 +304,62 @@ func (o *BffLogoutNotFound) readResponse(response runtime.ClientResponse, consum
 	return nil
 }
 
+// NewBffLogoutInternalServerError creates a BffLogoutInternalServerError with default headers values
+func NewBffLogoutInternalServerError() *BffLogoutInternalServerError {
+	return &BffLogoutInternalServerError{}
+}
+
+/*
+BffLogoutInternalServerError describes a response with status code 500, with default header values.
+
+Identity-provider configuration prevents safe session validation. Cookies are preserved so logout can be retried after repair.
+*/
+type BffLogoutInternalServerError struct {
+}
+
+// IsSuccess returns true when this bff logout internal server error response has a 2xx status code
+func (o *BffLogoutInternalServerError) IsSuccess() bool {
+	return false
+}
+
+// IsRedirect returns true when this bff logout internal server error response has a 3xx status code
+func (o *BffLogoutInternalServerError) IsRedirect() bool {
+	return false
+}
+
+// IsClientError returns true when this bff logout internal server error response has a 4xx status code
+func (o *BffLogoutInternalServerError) IsClientError() bool {
+	return false
+}
+
+// IsServerError returns true when this bff logout internal server error response has a 5xx status code
+func (o *BffLogoutInternalServerError) IsServerError() bool {
+	return true
+}
+
+// IsCode returns true when this bff logout internal server error response a status code equal to that given
+func (o *BffLogoutInternalServerError) IsCode(code int) bool {
+	return code == 500
+}
+
+// Code gets the status code for the bff logout internal server error response
+func (o *BffLogoutInternalServerError) Code() int {
+	return 500
+}
+
+func (o *BffLogoutInternalServerError) Error() string {
+	return fmt.Sprintf("[POST /api/logout][%d] bffLogoutInternalServerError", 500)
+}
+
+func (o *BffLogoutInternalServerError) String() string {
+	return fmt.Sprintf("[POST /api/logout][%d] bffLogoutInternalServerError", 500)
+}
+
+func (o *BffLogoutInternalServerError) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
+
+	return nil
+}
+
 // NewBffLogoutServiceUnavailable creates a BffLogoutServiceUnavailable with default headers values
 func NewBffLogoutServiceUnavailable() *BffLogoutServiceUnavailable {
 	return &BffLogoutServiceUnavailable{}
@@ -306,7 +368,7 @@ func NewBffLogoutServiceUnavailable() *BffLogoutServiceUnavailable {
 /*
 BffLogoutServiceUnavailable describes a response with status code 503, with default header values.
 
-Browser session storage is temporarily unavailable.
+Browser session storage or the identity provider is temporarily unavailable. Cookies are preserved so logout can be retried.
 */
 type BffLogoutServiceUnavailable struct {
 }
