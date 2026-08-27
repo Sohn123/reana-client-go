@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,8 +56,8 @@ type Metadata struct {
 type tokenResponse struct {
 	AccessToken      string `json:"access_token"`
 	RefreshToken     string `json:"refresh_token"`
-	ExpiresIn        int64  `json:"expires_in"`
-	RefreshExpiresIn int64  `json:"refresh_expires_in"`
+	ExpiresIn        *int64 `json:"expires_in"`
+	RefreshExpiresIn *int64 `json:"refresh_expires_in"`
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
 }
@@ -314,31 +315,52 @@ func (m *Manager) postForm(
 	return response, nil
 }
 
-func tokenExpiry(accessToken string, expiresIn int64, now time.Time) string {
-	if expiresIn > 0 {
-		return now.UTC().
-			Add(time.Duration(expiresIn) * time.Second).
-			Format(time.RFC3339)
+func lifetimeExpiry(
+	expiresIn *int64,
+	field string,
+	now time.Time,
+) (string, error) {
+	if expiresIn == nil {
+		return "", nil
+	}
+	if *expiresIn < 0 || *expiresIn > int64(math.MaxInt64/time.Second) {
+		return "", authenticationError(
+			"authentication server returned an invalid %s value",
+			field,
+		)
+	}
+	return now.UTC().
+		Add(time.Duration(*expiresIn) * time.Second).
+		Format(time.RFC3339), nil
+}
+
+func tokenExpiry(
+	accessToken string,
+	expiresIn *int64,
+	now time.Time,
+) (string, error) {
+	if expiresIn != nil {
+		return lifetimeExpiry(expiresIn, "expires_in", now)
 	}
 	parts := strings.Split(accessToken, ".")
 	if len(parts) != 3 {
-		return ""
+		return "", nil
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	var claims struct {
 		ExpiresAt json.Number `json:"exp"`
 	}
 	if json.Unmarshal(payload, &claims) != nil {
-		return ""
+		return "", nil
 	}
 	seconds, err := strconv.ParseInt(string(claims.ExpiresAt), 10, 64)
 	if err != nil {
-		return ""
+		return "", nil
 	}
-	return time.Unix(seconds, 0).UTC().Format(time.RFC3339)
+	return time.Unix(seconds, 0).UTC().Format(time.RFC3339), nil
 }
 
 func credentialsFromToken(
@@ -355,6 +377,22 @@ func credentialsFromToken(
 	if tokens.RefreshToken == "" {
 		tokens.RefreshToken = oldRefreshToken
 	}
+	accessTokenExpiresAt, err := tokenExpiry(
+		tokens.AccessToken,
+		tokens.ExpiresIn,
+		now,
+	)
+	if err != nil {
+		return Credentials{}, err
+	}
+	refreshTokenExpiresAt, err := lifetimeExpiry(
+		tokens.RefreshExpiresIn,
+		"refresh_expires_in",
+		now,
+	)
+	if err != nil {
+		return Credentials{}, err
+	}
 	credentials := Credentials{
 		Issuer:                      metadata.Issuer,
 		ClientID:                    metadata.CLIClientID,
@@ -363,17 +401,9 @@ func credentialsFromToken(
 		DeviceAuthorizationEndpoint: metadata.DeviceAuthorizationEndpoint,
 		RevocationEndpoint:          metadata.RevocationEndpoint,
 		AccessToken:                 tokens.AccessToken,
-		AccessTokenExpiresAt: tokenExpiry(
-			tokens.AccessToken,
-			tokens.ExpiresIn,
-			now,
-		),
-		RefreshToken: tokens.RefreshToken,
-	}
-	if tokens.RefreshExpiresIn > 0 {
-		credentials.RefreshTokenExpiresAt = now.UTC().
-			Add(time.Duration(tokens.RefreshExpiresIn) * time.Second).
-			Format(time.RFC3339)
+		AccessTokenExpiresAt:        accessTokenExpiresAt,
+		RefreshToken:                tokens.RefreshToken,
+		RefreshTokenExpiresAt:       refreshTokenExpiresAt,
 	}
 	return credentials, nil
 }

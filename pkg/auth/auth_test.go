@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -892,6 +893,7 @@ func TestNewManagerPropagatesStoreError(t *testing.T) {
 
 func TestTokenExpiry(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	value := func(seconds int64) *int64 { return &seconds }
 	encodeClaims := func(claims string) string {
 		return "header." + base64.RawURLEncoding.EncodeToString(
 			[]byte(claims),
@@ -900,31 +902,35 @@ func TestTokenExpiry(t *testing.T) {
 	cases := []struct {
 		name        string
 		accessToken string
-		expiresIn   int64
+		expiresIn   *int64
 		want        string
+		wantError   bool
 	}{
 		{
 			name:        "uses expires_in when positive",
 			accessToken: "opaque-token",
-			expiresIn:   3600,
+			expiresIn:   value(3600),
 			want:        now.Add(time.Hour).Format(time.RFC3339),
+		},
+		{
+			name:        "honors explicit zero",
+			accessToken: "opaque-token",
+			expiresIn:   value(0),
+			want:        now.Format(time.RFC3339),
 		},
 		{
 			name:        "falls back to JWT exp claim",
 			accessToken: encodeClaims(`{"exp":1755780000}`),
-			expiresIn:   0,
 			want:        time.Unix(1755780000, 0).UTC().Format(time.RFC3339),
 		},
 		{
 			name:        "not a compact JWT",
 			accessToken: "opaque-token",
-			expiresIn:   0,
 			want:        "",
 		},
 		{
 			name:        "malformed base64 payload",
 			accessToken: "header.not-valid-base64!!.sig",
-			expiresIn:   0,
 			want:        "",
 		},
 		{
@@ -932,28 +938,50 @@ func TestTokenExpiry(t *testing.T) {
 			accessToken: "header." + base64.RawURLEncoding.EncodeToString(
 				[]byte("not json"),
 			) + ".sig",
-			expiresIn: 0,
-			want:      "",
+			want: "",
 		},
 		{
 			name:        "exp claim is not an integer",
 			accessToken: encodeClaims(`{"exp":"soon"}`),
-			expiresIn:   0,
 			want:        "",
 		},
 		{
 			name:        "exp claim is missing",
 			accessToken: encodeClaims(`{}`),
-			expiresIn:   0,
 			want:        "",
+		},
+		{
+			name:        "rejects negative lifetime",
+			accessToken: "opaque-token",
+			expiresIn:   value(-1),
+			wantError:   true,
+		},
+		{
+			name:        "rejects duration overflow",
+			accessToken: "opaque-token",
+			expiresIn: value(
+				int64(math.MaxInt64/time.Second) + 1,
+			),
+			wantError: true,
 		},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			got := tokenExpiry(testCase.accessToken, testCase.expiresIn, now)
+			got, err := tokenExpiry(
+				testCase.accessToken,
+				testCase.expiresIn,
+				now,
+			)
+			if (err != nil) != testCase.wantError {
+				t.Fatalf(
+					"tokenExpiry error = %v, wantError = %t",
+					err,
+					testCase.wantError,
+				)
+			}
 			if got != testCase.want {
 				t.Fatalf(
-					"tokenExpiry(%q, %d) = %q, want %q",
+					"tokenExpiry(%q, %v) = %q, want %q",
 					testCase.accessToken,
 					testCase.expiresIn,
 					got,
@@ -1140,6 +1168,57 @@ func TestCredentialsFromTokenRequiresAccessToken(t *testing.T) {
 	if err == nil ||
 		!strings.Contains(err.Error(), "did not return an access token") {
 		t.Fatalf("expected missing access token error, got %v", err)
+	}
+}
+
+func TestCredentialsFromTokenHonorsExplicitZeroLifetimes(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	var tokens tokenResponse
+	if err := json.Unmarshal([]byte(`{
+        "access_token":"opaque-token",
+        "refresh_token":"refresh-token",
+        "expires_in":0,
+        "refresh_expires_in":0
+    }`), &tokens); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := credentialsFromToken(Metadata{}, tokens, "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := now.Format(time.RFC3339)
+	if credentials.AccessTokenExpiresAt != want {
+		t.Fatalf(
+			"access expiry = %q, want %q",
+			credentials.AccessTokenExpiresAt,
+			want,
+		)
+	}
+	if credentials.RefreshTokenExpiresAt != want {
+		t.Fatalf(
+			"refresh expiry = %q, want %q",
+			credentials.RefreshTokenExpiresAt,
+			want,
+		)
+	}
+	if accessTokenValid(credentials, now) {
+		t.Fatal("zero-lifetime access token unexpectedly considered valid")
+	}
+}
+
+func TestCredentialsFromTokenRejectsInvalidRefreshLifetime(t *testing.T) {
+	invalid := int64(-1)
+	_, err := credentialsFromToken(
+		Metadata{},
+		tokenResponse{
+			AccessToken:      "opaque-token",
+			RefreshExpiresIn: &invalid,
+		},
+		"",
+		time.Now(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "refresh_expires_in") {
+		t.Fatalf("invalid refresh lifetime error = %v", err)
 	}
 }
 
@@ -1364,6 +1443,33 @@ func TestPostFormReturnsErrorOnNonJSONResponse(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "non-JSON response") {
 		t.Fatalf("expected non-JSON response error, got %v", err)
+	}
+}
+
+func TestPostFormRejectsUnrepresentableTokenLifetimes(t *testing.T) {
+	for name, payload := range map[string]string{
+		"fractional": `{"access_token":"token","expires_in":1.5}`,
+		"oversized":  `{"access_token":"token","expires_in":9223372036854775808}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			manager := testManager(
+				t,
+				func(*http.Request) (*http.Response, error) {
+					return jsonResponse(http.StatusOK, payload), nil
+				},
+			)
+			var target tokenResponse
+			_, err := manager.postForm(
+				context.Background(),
+				"https://issuer.example.org/token",
+				"token refresh",
+				url.Values{},
+				&target,
+			)
+			if err == nil {
+				t.Fatal("invalid lifetime unexpectedly accepted")
+			}
+		})
 	}
 }
 
