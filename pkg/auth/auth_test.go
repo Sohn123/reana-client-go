@@ -10,7 +10,9 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -845,6 +847,1041 @@ func TestLogoutAcceptsEmptyRevocationResponseAndClearsTokens(t *testing.T) {
 	stored, _ := manager.Store.Get("https://reana.example.org")
 	if stored.AccessToken != "" || stored.RefreshToken != "" {
 		t.Fatalf("tokens were not cleared: %+v", stored)
+	}
+}
+
+func TestNewManagerWiresStoreHTTPClientAndSleep(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("REANA_CLIENT_CONFIG", "")
+
+	manager, err := NewManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.Store == nil || manager.HTTPClient == nil ||
+		manager.Now == nil ||
+		manager.Sleep == nil {
+		t.Fatalf("manager was not fully wired: %+v", manager)
+	}
+	if manager.Now().IsZero() {
+		t.Fatal("Now() returned the zero time")
+	}
+	if err := manager.Sleep(context.Background(), time.Millisecond); err != nil {
+		t.Fatalf("Sleep did not complete normally: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Sleep(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatalf(
+			"Sleep on a cancelled context = %v, want context.Canceled",
+			err,
+		)
+	}
+}
+
+func TestNewManagerPropagatesStoreError(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("REANA_CLIENT_CONFIG", "")
+	if _, err := NewManager(); err == nil {
+		t.Fatal(
+			"expected an error when the credential store path cannot be resolved",
+		)
+	}
+}
+
+func TestTokenExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	encodeClaims := func(claims string) string {
+		return "header." + base64.RawURLEncoding.EncodeToString(
+			[]byte(claims),
+		) + ".sig"
+	}
+	cases := []struct {
+		name        string
+		accessToken string
+		expiresIn   int64
+		want        string
+	}{
+		{
+			name:        "uses expires_in when positive",
+			accessToken: "opaque-token",
+			expiresIn:   3600,
+			want:        now.Add(time.Hour).Format(time.RFC3339),
+		},
+		{
+			name:        "falls back to JWT exp claim",
+			accessToken: encodeClaims(`{"exp":1755780000}`),
+			expiresIn:   0,
+			want:        time.Unix(1755780000, 0).UTC().Format(time.RFC3339),
+		},
+		{
+			name:        "not a compact JWT",
+			accessToken: "opaque-token",
+			expiresIn:   0,
+			want:        "",
+		},
+		{
+			name:        "malformed base64 payload",
+			accessToken: "header.not-valid-base64!!.sig",
+			expiresIn:   0,
+			want:        "",
+		},
+		{
+			name: "payload is not JSON",
+			accessToken: "header." + base64.RawURLEncoding.EncodeToString(
+				[]byte("not json"),
+			) + ".sig",
+			expiresIn: 0,
+			want:      "",
+		},
+		{
+			name:        "exp claim is not an integer",
+			accessToken: encodeClaims(`{"exp":"soon"}`),
+			expiresIn:   0,
+			want:        "",
+		},
+		{
+			name:        "exp claim is missing",
+			accessToken: encodeClaims(`{}`),
+			expiresIn:   0,
+			want:        "",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := tokenExpiry(testCase.accessToken, testCase.expiresIn, now)
+			if got != testCase.want {
+				t.Fatalf(
+					"tokenExpiry(%q, %d) = %q, want %q",
+					testCase.accessToken,
+					testCase.expiresIn,
+					got,
+					testCase.want,
+				)
+			}
+		})
+	}
+}
+
+func TestAccessTokenValid(t *testing.T) {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name        string
+		credentials Credentials
+		want        bool
+	}{
+		{"no access token", Credentials{}, false},
+		{
+			"no expiry recorded",
+			Credentials{AccessToken: "a.b.c"},
+			true,
+		},
+		{
+			"expired",
+			Credentials{
+				AccessToken: "a.b.c",
+				AccessTokenExpiresAt: now.Add(-time.Minute).
+					Format(time.RFC3339),
+			},
+			false,
+		},
+		{
+			"within expiry leeway",
+			Credentials{
+				AccessToken: "a.b.c",
+				AccessTokenExpiresAt: now.Add(30 * time.Second).
+					Format(time.RFC3339),
+			},
+			false,
+		},
+		{
+			"valid",
+			Credentials{
+				AccessToken:          "a.b.c",
+				AccessTokenExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
+			},
+			true,
+		},
+		{
+			"unparsable expiry",
+			Credentials{
+				AccessToken:          "a.b.c",
+				AccessTokenExpiresAt: "not-a-time",
+			},
+			false,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := accessTokenValid(testCase.credentials, now); got != testCase.want {
+				t.Fatalf(
+					"accessTokenValid(%+v) = %v, want %v",
+					testCase.credentials,
+					got,
+					testCase.want,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateMetadataRejectsMissingOrInvalidFields(t *testing.T) {
+	valid := Metadata{
+		Issuer:                "https://issuer.example.org",
+		AuthorizationEndpoint: "https://issuer.example.org/auth",
+		TokenEndpoint:         "https://issuer.example.org/token",
+		CLIClientID:           "reana-cli",
+	}
+	if err := validateMetadata(valid, false); err != nil {
+		t.Fatalf("expected valid metadata to pass, got %v", err)
+	}
+
+	cases := []struct {
+		name           string
+		mutate         func(Metadata) Metadata
+		deviceRequired bool
+	}{
+		{
+			"missing issuer",
+			func(m Metadata) Metadata { m.Issuer = ""; return m },
+			false,
+		},
+		{
+			"missing authorization endpoint",
+			func(m Metadata) Metadata { m.AuthorizationEndpoint = ""; return m },
+			false,
+		},
+		{
+			"missing token endpoint",
+			func(m Metadata) Metadata { m.TokenEndpoint = ""; return m },
+			false,
+		},
+		{
+			"missing client id",
+			func(m Metadata) Metadata { m.CLIClientID = ""; return m },
+			false,
+		},
+		{
+			"missing device endpoint when required",
+			func(m Metadata) Metadata { return m },
+			true,
+		},
+		{
+			"invalid revocation endpoint",
+			func(m Metadata) Metadata { m.RevocationEndpoint = "http://insecure"; return m },
+			false,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			metadata := testCase.mutate(valid)
+			if err := validateMetadata(metadata, testCase.deviceRequired); err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateStoredMetadataRejectsMissingOrInvalidFields(t *testing.T) {
+	valid := Metadata{
+		Issuer:        "https://issuer.example.org",
+		TokenEndpoint: "https://issuer.example.org/token",
+		CLIClientID:   "reana-cli",
+	}
+	if err := validateStoredMetadata(valid); err != nil {
+		t.Fatalf("expected valid stored metadata to pass, got %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(Metadata) Metadata
+	}{
+		{
+			"missing issuer",
+			func(m Metadata) Metadata { m.Issuer = ""; return m },
+		},
+		{
+			"missing token endpoint",
+			func(m Metadata) Metadata { m.TokenEndpoint = ""; return m },
+		},
+		{
+			"missing client id",
+			func(m Metadata) Metadata { m.CLIClientID = ""; return m },
+		},
+		{
+			"invalid authorization endpoint",
+			func(m Metadata) Metadata {
+				m.AuthorizationEndpoint = "not-a-url"
+				return m
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			metadata := testCase.mutate(valid)
+			if err := validateStoredMetadata(metadata); err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !IsAuthenticationError(validateStoredMetadata(metadata)) {
+				t.Fatal("expected an AuthenticationError")
+			}
+		})
+	}
+}
+
+func TestCredentialsFromTokenRequiresAccessToken(t *testing.T) {
+	_, err := credentialsFromToken(
+		Metadata{},
+		tokenResponse{},
+		"old-refresh",
+		time.Now(),
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "did not return an access token") {
+		t.Fatalf("expected missing access token error, got %v", err)
+	}
+}
+
+func TestAccessTokenReturnsCachedTokenWithoutRefreshing(t *testing.T) {
+	called := false
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		called = true
+		return jsonResponse(http.StatusOK, `{}`), nil
+	})
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		AccessToken: "cached.access.token",
+		AccessTokenExpiresAt: manager.Now().
+			Add(time.Hour).
+			Format(time.RFC3339),
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	token, err := manager.AccessToken(
+		context.Background(),
+		"https://reana.example.org",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "cached.access.token" {
+		t.Fatalf("token = %q, want cached token", token)
+	}
+	if called {
+		t.Fatal("expected no network call for a still-valid cached token")
+	}
+}
+
+func TestAccessTokenUsesActiveServerWhenServerURLEmpty(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call")
+		return nil, nil
+	})
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		AccessToken: "cached.access.token",
+		AccessTokenExpiresAt: manager.Now().
+			Add(time.Hour).
+			Format(time.RFC3339),
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	token, err := manager.AccessToken(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "cached.access.token" {
+		t.Fatalf("token = %q, want cached token", token)
+	}
+}
+
+func TestAccessTokenErrorsWhenNoActiveServer(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call")
+		return nil, nil
+	})
+	_, err := manager.AccessToken(context.Background(), "")
+	if err == nil ||
+		!strings.Contains(err.Error(), "not connected to any REANA cluster") {
+		t.Fatalf("expected no-active-cluster error, got %v", err)
+	}
+}
+
+func TestLogoutUsesActiveServerWhenServerURLEmpty(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusNoContent, ""), nil
+		},
+	)
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		RevocationEndpoint: "https://issuer.example.org/revoke",
+		AccessToken:        "access",
+		RefreshToken:       "refresh",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	warning, err := manager.Logout(context.Background(), "")
+	if err != nil || warning != "" {
+		t.Fatalf("logout = warning %q, error %v", warning, err)
+	}
+	stored, _ := manager.Store.Get("https://reana.example.org")
+	if stored.AccessToken != "" {
+		t.Fatalf("tokens were not cleared: %+v", stored)
+	}
+}
+
+func TestLogoutErrorsWhenNoActiveServer(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call")
+		return nil, nil
+	})
+	_, err := manager.Logout(context.Background(), "")
+	if err == nil ||
+		!strings.Contains(err.Error(), "not connected to any REANA cluster") {
+		t.Fatalf("expected no-active-cluster error, got %v", err)
+	}
+}
+
+func TestDiscoverReturnsConnectionErrorWhenServerUnreachable(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})
+	_, err := manager.Discover(
+		context.Background(),
+		"https://reana.example.org",
+	)
+	if err == nil || !strings.Contains(err.Error(), "could not connect") {
+		t.Fatalf("expected connection error, got %v", err)
+	}
+}
+
+func TestDiscoverReturnsErrorForNonSuccessStatus(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusInternalServerError, `{}`), nil
+	})
+	_, err := manager.Discover(
+		context.Background(),
+		"https://reana.example.org",
+	)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("expected HTTP 500 discovery error, got %v", err)
+	}
+}
+
+func TestDiscoverRejectsInvalidMetadata(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(
+			http.StatusOK,
+			`{"authorization_endpoint":"https://issuer.example.org/auth","token_endpoint":"https://issuer.example.org/token","reana_cli_client_id":"reana-cli"}`,
+		), nil
+	})
+	_, err := manager.Discover(
+		context.Background(),
+		"https://reana.example.org",
+	)
+	if !IsAuthenticationError(err) {
+		t.Fatalf(
+			"expected an AuthenticationError for missing issuer, got %v",
+			err,
+		)
+	}
+}
+
+func TestRevokeBestEffortSkipsWhenEndpointOrTokenMissing(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call")
+		return nil, nil
+	})
+	if warning := manager.revokeBestEffort(context.Background(), Metadata{}, "refresh"); warning != "" {
+		t.Fatalf(
+			"warning = %q, want empty when revocation endpoint is missing",
+			warning,
+		)
+	}
+	if warning := manager.revokeBestEffort(context.Background(), Metadata{
+		RevocationEndpoint: "https://issuer.example.org/revoke",
+	}, ""); warning != "" {
+		t.Fatalf(
+			"warning = %q, want empty when refresh token is missing",
+			warning,
+		)
+	}
+}
+
+func TestRevokeBestEffortReturnsNetworkErrorMessage(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network unreachable")
+	})
+	warning := manager.revokeBestEffort(context.Background(), Metadata{
+		RevocationEndpoint: "https://issuer.example.org/revoke",
+	}, "refresh")
+	if !strings.Contains(warning, "network unreachable") {
+		t.Fatalf("warning = %q, want network error message", warning)
+	}
+}
+
+func TestRevokeBestEffortReturnsHTTPStatusMessage(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusInternalServerError, ""), nil
+	})
+	warning := manager.revokeBestEffort(context.Background(), Metadata{
+		RevocationEndpoint: "https://issuer.example.org/revoke",
+	}, "refresh")
+	if !strings.Contains(warning, "HTTP 500") {
+		t.Fatalf("warning = %q, want HTTP 500 message", warning)
+	}
+}
+
+func TestPostFormReturnsWrappedErrorOnTransportFailure(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection reset")
+	})
+	var target tokenResponse
+	_, err := manager.postForm(
+		context.Background(),
+		"https://issuer.example.org/token",
+		"token refresh",
+		url.Values{},
+		&target,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "could not complete token refresh") {
+		t.Fatalf("expected wrapped transport error, got %v", err)
+	}
+}
+
+func TestPostFormReturnsErrorOnNonJSONResponse(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, "not json"), nil
+	})
+	var target tokenResponse
+	_, err := manager.postForm(
+		context.Background(),
+		"https://issuer.example.org/token",
+		"token refresh",
+		url.Values{},
+		&target,
+	)
+	if err == nil || !strings.Contains(err.Error(), "non-JSON response") {
+		t.Fatalf("expected non-JSON response error, got %v", err)
+	}
+}
+
+func TestRefreshErrorsWhenNoRefreshToken(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call")
+		return nil, nil
+	})
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		Issuer:        "https://issuer.example.org",
+		TokenEndpoint: "https://issuer.example.org/token",
+		ClientID:      "reana-cli",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	_, err := manager.Refresh(
+		context.Background(),
+		"https://reana.example.org",
+		Credentials{},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "please run `reana-client-go login`") {
+		t.Fatalf("expected missing refresh token error, got %v", err)
+	}
+}
+
+func TestRefreshErrorsOnInvalidStoredMetadata(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call")
+		return nil, nil
+	})
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		RefreshToken: "refresh",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	_, err := manager.Refresh(
+		context.Background(),
+		"https://reana.example.org",
+		Credentials{},
+	)
+	if !IsAuthenticationError(err) {
+		t.Fatalf(
+			"expected an AuthenticationError for invalid stored metadata, got %v",
+			err,
+		)
+	}
+}
+
+func TestRefreshReturnsServerErrorMessage(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(
+			http.StatusBadRequest,
+			`{"error":"server_error","error_description":"issuer is unavailable"}`,
+		), nil
+	})
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		Issuer:        "https://issuer.example.org",
+		TokenEndpoint: "https://issuer.example.org/token",
+		ClientID:      "reana-cli",
+		RefreshToken:  "refresh",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	_, err := manager.Refresh(
+		context.Background(),
+		"https://reana.example.org",
+		Credentials{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "issuer is unavailable") {
+		t.Fatalf("expected server error message, got %v", err)
+	}
+}
+
+func TestRefreshClearsCredentialsOnInvalidGrant(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(
+			http.StatusBadRequest,
+			`{"error":"invalid_grant"}`,
+		), nil
+	})
+	if _, err := manager.Store.Put("https://reana.example.org", Credentials{
+		Issuer:        "https://issuer.example.org",
+		TokenEndpoint: "https://issuer.example.org/token",
+		ClientID:      "reana-cli",
+		RefreshToken:  "refresh",
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+	_, err := manager.Refresh(
+		context.Background(),
+		"https://reana.example.org",
+		Credentials{},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "please run `reana-client-go login`") {
+		t.Fatalf("expected cleared-credentials login error, got %v", err)
+	}
+	stored, getErr := manager.Store.Get("https://reana.example.org")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.RefreshToken != "" {
+		t.Fatalf("refresh token was not cleared: %+v", stored)
+	}
+}
+
+func TestLoginDeviceReturnsErrorForNonSuccessDeviceAuthorizationStatus(
+	t *testing.T,
+) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Path {
+			case discoveryPath:
+				return jsonResponse(http.StatusOK, `{
+                "issuer":"https://issuer.example.org",
+                "authorization_endpoint":"https://issuer.example.org/auth",
+                "token_endpoint":"https://issuer.example.org/token",
+                "device_authorization_endpoint":"https://issuer.example.org/device",
+                "reana_cli_client_id":"reana-cli"
+            }`), nil
+			case "/device":
+				return jsonResponse(
+					http.StatusBadRequest,
+					`{"error":"invalid_client","error_description":"unknown client"}`,
+				), nil
+			default:
+				t.Fatalf("unexpected request: %s", request.URL)
+				return nil, nil
+			}
+		},
+	)
+	_, err := manager.LoginDevice(
+		context.Background(),
+		"https://reana.example.org",
+		func(DevicePrompt) {},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unknown client") {
+		t.Fatalf("expected device authorization failure, got %v", err)
+	}
+}
+
+func TestLoginDeviceReturnsErrorForIncompleteDeviceResponse(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Path {
+			case discoveryPath:
+				return jsonResponse(http.StatusOK, `{
+                "issuer":"https://issuer.example.org",
+                "authorization_endpoint":"https://issuer.example.org/auth",
+                "token_endpoint":"https://issuer.example.org/token",
+                "device_authorization_endpoint":"https://issuer.example.org/device",
+                "reana_cli_client_id":"reana-cli"
+            }`), nil
+			case "/device":
+				return jsonResponse(
+					http.StatusOK,
+					`{"user_code":"ABCD","verification_uri":"https://issuer.example.org/verify"}`,
+				), nil
+			default:
+				t.Fatalf("unexpected request: %s", request.URL)
+				return nil, nil
+			}
+		},
+	)
+	_, err := manager.LoginDevice(
+		context.Background(),
+		"https://reana.example.org",
+		func(DevicePrompt) {},
+	)
+	if err == nil || !strings.Contains(err.Error(), "valid code and expiry") {
+		t.Fatalf("expected incomplete device response error, got %v", err)
+	}
+}
+
+func TestLoginDeviceTerminalPollingErrors(t *testing.T) {
+	cases := []struct {
+		name       string
+		pollBody   string
+		wantErrMsg string
+	}{
+		{
+			"expired token",
+			`{"error":"expired_token"}`,
+			"device login expired",
+		},
+		{
+			"access denied",
+			`{"error":"access_denied"}`,
+			"device login was denied",
+		},
+		{
+			"unknown error",
+			`{"error":"temporarily_unavailable","error_description":"try later"}`,
+			"try later",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager := testManager(
+				t,
+				func(request *http.Request) (*http.Response, error) {
+					switch request.URL.Path {
+					case discoveryPath:
+						return jsonResponse(http.StatusOK, `{
+                        "issuer":"https://issuer.example.org",
+                        "authorization_endpoint":"https://issuer.example.org/auth",
+                        "token_endpoint":"https://issuer.example.org/token",
+                        "device_authorization_endpoint":"https://issuer.example.org/device",
+                        "reana_cli_client_id":"reana-cli"
+                    }`), nil
+					case "/device":
+						return jsonResponse(
+							http.StatusOK,
+							`{"device_code":"device","user_code":"ABCD","verification_uri":"https://issuer.example.org/verify","expires_in":300,"interval":1}`,
+						), nil
+					case "/token":
+						return jsonResponse(
+							http.StatusBadRequest,
+							testCase.pollBody,
+						), nil
+					default:
+						t.Fatalf("unexpected request: %s", request.URL)
+						return nil, nil
+					}
+				},
+			)
+			_, err := manager.LoginDevice(
+				context.Background(),
+				"https://reana.example.org",
+				func(DevicePrompt) {},
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), testCase.wantErrMsg) {
+				t.Fatalf(
+					"error = %v, want it to contain %q",
+					err,
+					testCase.wantErrMsg,
+				)
+			}
+		})
+	}
+}
+
+func TestLoginDeviceHonoursSlowDownBeforeSucceeding(t *testing.T) {
+	polls := 0
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Path {
+			case discoveryPath:
+				return jsonResponse(http.StatusOK, `{
+                "issuer":"https://issuer.example.org",
+                "authorization_endpoint":"https://issuer.example.org/auth",
+                "token_endpoint":"https://issuer.example.org/token",
+                "device_authorization_endpoint":"https://issuer.example.org/device",
+                "reana_cli_client_id":"reana-cli"
+            }`), nil
+			case "/device":
+				return jsonResponse(
+					http.StatusOK,
+					`{"device_code":"device","user_code":"ABCD","verification_uri":"https://issuer.example.org/verify","expires_in":300,"interval":1}`,
+				), nil
+			case "/token":
+				polls++
+				if polls == 1 {
+					return jsonResponse(
+						http.StatusBadRequest,
+						`{"error":"slow_down"}`,
+					), nil
+				}
+				return jsonResponse(
+					http.StatusOK,
+					`{"access_token":"a.b.c","refresh_token":"refresh","expires_in":3600}`,
+				), nil
+			default:
+				t.Fatalf("unexpected request: %s", request.URL)
+				return nil, nil
+			}
+		},
+	)
+	credentials, err := manager.LoginDevice(
+		context.Background(),
+		"https://reana.example.org",
+		func(DevicePrompt) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polls != 2 || credentials.AccessToken != "a.b.c" {
+		t.Fatalf("polls = %d, credentials = %+v", polls, credentials)
+	}
+}
+
+func TestLoginBrowserReturnsCallbackError(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{
+            "issuer":"https://issuer.example.org",
+            "authorization_endpoint":"https://issuer.example.org/auth",
+            "token_endpoint":"https://issuer.example.org/token",
+            "reana_cli_client_id":"reana-cli"
+        }`), nil
+		},
+	)
+	_, err := manager.LoginBrowser(
+		context.Background(),
+		"https://reana.example.org",
+		func(string) {},
+		func(authorizationURL string) error {
+			parsed, parseErr := url.Parse(authorizationURL)
+			if parseErr != nil {
+				return parseErr
+			}
+			redirect, parseErr := url.Parse(parsed.Query().Get("redirect_uri"))
+			if parseErr != nil {
+				return parseErr
+			}
+			callback := redirect.String() +
+				"?error=access_denied&error_description=user+declined&state=" +
+				url.QueryEscape(parsed.Query().Get("state"))
+			response, requestErr := http.Get(callback) //nolint:gosec
+			if requestErr == nil {
+				response.Body.Close()
+			}
+			return requestErr
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "user declined") {
+		t.Fatalf("expected callback error to propagate, got %v", err)
+	}
+}
+
+func TestLoginBrowserRejectsStateMismatch(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{
+            "issuer":"https://issuer.example.org",
+            "authorization_endpoint":"https://issuer.example.org/auth",
+            "token_endpoint":"https://issuer.example.org/token",
+            "reana_cli_client_id":"reana-cli"
+        }`), nil
+		},
+	)
+	_, err := manager.LoginBrowser(
+		context.Background(),
+		"https://reana.example.org",
+		func(string) {},
+		func(authorizationURL string) error {
+			parsed, parseErr := url.Parse(authorizationURL)
+			if parseErr != nil {
+				return parseErr
+			}
+			redirect, parseErr := url.Parse(parsed.Query().Get("redirect_uri"))
+			if parseErr != nil {
+				return parseErr
+			}
+			callback := redirect.String() + "?code=code&state=wrong-state"
+			response, requestErr := http.Get(callback) //nolint:gosec
+			if requestErr == nil {
+				response.Body.Close()
+			}
+			return requestErr
+		},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "state parameter mismatch") {
+		t.Fatalf("expected state mismatch error, got %v", err)
+	}
+}
+
+func TestLoginBrowserRejectsTokenExchangeFailure(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Path {
+			case discoveryPath:
+				return jsonResponse(http.StatusOK, `{
+                "issuer":"https://issuer.example.org",
+                "authorization_endpoint":"https://issuer.example.org/auth",
+                "token_endpoint":"https://issuer.example.org/token",
+                "reana_cli_client_id":"reana-cli"
+            }`), nil
+			case "/token":
+				return jsonResponse(
+					http.StatusBadRequest,
+					`{"error":"invalid_grant","error_description":"code expired"}`,
+				), nil
+			default:
+				t.Fatalf("unexpected request: %s", request.URL)
+				return nil, nil
+			}
+		},
+	)
+	_, err := manager.LoginBrowser(
+		context.Background(),
+		"https://reana.example.org",
+		func(string) {},
+		func(authorizationURL string) error {
+			parsed, parseErr := url.Parse(authorizationURL)
+			if parseErr != nil {
+				return parseErr
+			}
+			callback := parsed.Query().
+				Get("redirect_uri") +
+				"?code=code&state=" + url.QueryEscape(
+				parsed.Query().Get("state"),
+			)
+			response, requestErr := http.Get(callback) //nolint:gosec
+			if requestErr == nil {
+				response.Body.Close()
+			}
+			return requestErr
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "code expired") {
+		t.Fatalf("expected token exchange failure, got %v", err)
+	}
+}
+
+func TestLoginBrowserTimesOutWhenNoCallbackArrives(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{
+            "issuer":"https://issuer.example.org",
+            "authorization_endpoint":"https://issuer.example.org/auth",
+            "token_endpoint":"https://issuer.example.org/token",
+            "reana_cli_client_id":"reana-cli"
+        }`), nil
+		},
+	)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		20*time.Millisecond,
+	)
+	defer cancel()
+	_, err := manager.LoginBrowser(
+		ctx,
+		"https://reana.example.org",
+		func(string) {},
+		func(string) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "browser login timed out") {
+		t.Fatalf("expected browser login timeout, got %v", err)
+	}
+}
+
+func TestFirstNonEmptyReturnsFirstNonEmptyValue(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{"first wins", []string{"a", "b"}, "a"},
+		{"skips leading empties", []string{"", "", "b"}, "b"},
+		{"all empty falls back", []string{"", ""}, "unknown error"},
+		{"no arguments falls back", nil, "unknown error"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := firstNonEmpty(testCase.values...); got != testCase.want {
+				t.Fatalf(
+					"firstNonEmpty(%v) = %q, want %q",
+					testCase.values,
+					got,
+					testCase.want,
+				)
+			}
+		})
+	}
+}
+
+func TestIsJWTRecognisesCompactSerialisation(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		want  bool
+	}{
+		{"three non-empty parts", "header.payload.signature", true},
+		{"unsigned JWT (empty signature)", "header.payload.", false},
+		{"missing a part", "header.payload", false},
+		{"too many parts", "a.b.c.d", false},
+		{"empty string", "", false},
+		{"opaque token", "not-a-jwt-at-all", false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := IsJWT(testCase.token); got != testCase.want {
+				t.Fatalf(
+					"IsJWT(%q) = %v, want %v",
+					testCase.token,
+					got,
+					testCase.want,
+				)
+			}
+		})
+	}
+}
+
+func TestIsAuthenticationErrorDetectsWrappedAuthenticationErrors(t *testing.T) {
+	authErr := authenticationError("not signed in")
+	if !IsAuthenticationError(authErr) {
+		t.Fatal("expected the raw AuthenticationError to be detected")
+	}
+	wrapped := fmt.Errorf("during login: %w", authErr)
+	if !IsAuthenticationError(wrapped) {
+		t.Fatal("expected a wrapped AuthenticationError to be detected")
+	}
+	if IsAuthenticationError(errors.New("plain error")) {
+		t.Fatal("a plain error must not be reported as an AuthenticationError")
+	}
+	if IsAuthenticationError(nil) {
+		t.Fatal("a nil error must not be reported as an AuthenticationError")
 	}
 }
 

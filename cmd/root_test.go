@@ -13,12 +13,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reanahub/reana-client-go/pkg/auth"
 	"reanahub/reana-client-go/pkg/errorhandler"
 	"reanahub/reana-client-go/pkg/validator"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	log "github.com/sirupsen/logrus"
 
@@ -396,5 +399,55 @@ func TestLogCmdFlagsRedactsAccessToken(t *testing.T) {
 	}
 	if !strings.Contains(logged, "workflow: analysis") {
 		t.Fatalf("non-sensitive flag missing: %s", logged)
+	}
+}
+
+func TestValidateFlagsResolvesServerURLFromActiveCredentialStore(t *testing.T) {
+	t.Setenv("REANA_CLIENT_CONFIG", t.TempDir()+"/credentials.json")
+	t.Setenv("REANA_SERVER_URL", "")
+	t.Setenv("REANA_ACCESS_TOKEN", "")
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	store, err := auth.NewStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("https://reana.example.org", auth.Credentials{
+		AccessToken: "a.b.c",
+		AccessTokenExpiresAt: time.Now().
+			Add(time.Hour).
+			Format(time.RFC3339),
+	}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := NewRootCmd()
+	cmd.Flags().String("access-token", "", "")
+
+	if err := validateFlags(cmd); err != nil {
+		t.Fatalf("Got unexpected error '%s'", err.Error())
+	}
+	if got := viper.GetString("server-url"); got != "https://reana.example.org" {
+		t.Fatalf(
+			"server-url = %q, want the active credential store server",
+			got,
+		)
+	}
+}
+
+func TestBindViperToCmdFlagPropagatesSetError(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.Set("retries", "not-a-number")
+
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	flags.Int("retries", 0, "")
+	flag := flags.Lookup("retries")
+
+	if err := bindViperToCmdFlag(flag); err == nil {
+		t.Fatal(
+			"expected an error when the viper value cannot be applied to the flag",
+		)
 	}
 }

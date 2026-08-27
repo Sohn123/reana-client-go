@@ -246,6 +246,64 @@ func TestAPIClientDisablesGoOpenAPIDumpsAtDebugLevel(t *testing.T) {
 	}
 }
 
+func TestStreamingHTTPClientReturnsBoundedClientWithNoTimeout(t *testing.T) {
+	setServerURL(t, "https://reana.example")
+
+	httpClient, u, err := StreamingHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if httpClient.Timeout != 0 {
+		t.Fatalf(
+			"Timeout = %v, want 0 (no whole-request deadline)",
+			httpClient.Timeout,
+		)
+	}
+	if u.Host != "reana.example" {
+		t.Fatalf("host = %q, want reana.example", u.Host)
+	}
+	transport, ok := httpClient.Transport.(*boundedResponseTransport)
+	if !ok {
+		t.Fatalf(
+			"transport type = %T, want *boundedResponseTransport",
+			httpClient.Transport,
+		)
+	}
+	inner, ok := transport.transport.(*http.Transport)
+	if !ok {
+		t.Fatalf(
+			"inner transport type = %T, want *http.Transport",
+			transport.transport,
+		)
+	}
+	if inner.ResponseHeaderTimeout != apiRequestTimeout {
+		t.Fatalf(
+			"ResponseHeaderTimeout = %v, want %v",
+			inner.ResponseHeaderTimeout,
+			apiRequestTimeout,
+		)
+	}
+}
+
+func TestStreamingHTTPClientRejectsMissingServerURL(t *testing.T) {
+	setServerURL(t, "")
+
+	_, _, err := StreamingHTTPClient()
+	if err == nil ||
+		!strings.Contains(err.Error(), "REANA_SERVER_URL is not set") {
+		t.Fatalf("expected missing server URL error, got %v", err)
+	}
+}
+
+func TestStreamingHTTPClientRejectsCleartextNonLoopback(t *testing.T) {
+	setServerURL(t, "http://reana.example")
+
+	_, _, err := StreamingHTTPClient()
+	if err == nil || !strings.Contains(err.Error(), "cleartext HTTP") {
+		t.Fatalf("expected cleartext bearer rejection, got %v", err)
+	}
+}
+
 func TestGetInteractiveSessionSecret(t *testing.T) {
 	workflow := "analysis/run 1?"
 	server := httptest.NewServer(
