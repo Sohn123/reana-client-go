@@ -20,14 +20,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
-	configPathEnv = "REANA_CLIENT_CONFIG"
-	caCertsEnv    = "REANA_SERVER_CA_CERTS"
-	insecureEnv   = "REANA_INSECURE"
+	configPathEnv        = "REANA_CLIENT_CONFIG"
+	caCertsEnv           = "REANA_SERVER_CA_CERTS"
+	insecureEnv          = "REANA_INSECURE"
+	loginLoopbackPortEnv = "REANA_CLIENT_LOGIN_LOOPBACK_PORT"
 )
+
+var insecureWarningOnce sync.Once
 
 // NormalizeServerURL returns the canonical credential-store key for a server.
 func NormalizeServerURL(serverURL string) (string, error) {
@@ -116,6 +122,11 @@ func NewHTTPClient() (*http.Client, error) {
 		}
 		// This is an explicit local-development escape hatch matching the Python client.
 		tlsConfig.InsecureSkipVerify = insecure //nolint:gosec
+		if insecure {
+			insecureWarningOnce.Do(func() {
+				log.Warn("TLS certificate verification is disabled by REANA_INSECURE.")
+			})
+		}
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig

@@ -72,9 +72,41 @@ Authenticate against a REANA deployment using the browser-based OIDC flow:
 $ reana-client-go login --server-url https://reana.example.org
 ```
 
+On a remote or browserless machine, use the interactive device flow instead:
+
+```console
+$ reana-client-go login --headless --server-url https://reana.example.org
+```
+
+Browser login normally uses an OS-assigned loopback port. If the identity
+provider requires an exact redirect URI, set
+`REANA_CLIENT_LOGIN_LOOPBACK_PORT=<port>` and register
+`http://127.0.0.1:<port>/callback`. Login fails with an actionable error if the
+configured port is invalid or already occupied.
+
 The client stores renewable OIDC credentials in the shared REANA client
-configuration. Use `reana-client-go logout` to revoke and remove them. The
+configuration at `~/.config/reana/reana-client.json`, or at the path selected by
+`REANA_CLIENT_CONFIG`. The file is permission-restricted to `0600`. Use
+`reana-client-go logout` to revoke and remove the credentials. The
 `--access-token` option remains available as an explicit per-command override.
+
+For CI, obtain credentials once with an interactive browser or headless login,
+store the JSON as a protected secret, and restore it to a unique private file:
+
+```console
+$ credential_file="$(mktemp)"
+$ trap 'rm -f "$credential_file"' EXIT
+$ chmod 600 "$credential_file"
+$ printf '%s' "$REANA_CREDENTIALS_SECRET" > "$credential_file"
+$ export REANA_CLIENT_CONFIG="$credential_file"
+```
+
+This immutable-secret pattern is safe only when the issuer permits reuse of the
+stored refresh token. If refresh-token rotation invalidates the previous token,
+the client writes the replacement only to the current job's local file; later or
+concurrent jobs restoring the original secret will fail. Such deployments need a
+mutable, serialised secret store or an issuer-supported non-rotating service
+credential.
 
 TLS certificate verification is enabled by default. Private deployments can set
 `REANA_SERVER_CA_CERTS` to a PEM CA bundle. `REANA_INSECURE=true` disables

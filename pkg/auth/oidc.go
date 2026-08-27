@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -553,8 +554,29 @@ func (m *Manager) LoginBrowser(
 	if err != nil {
 		return Credentials{}, err
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	loopbackPort := 0
+	rawLoopbackPort := strings.TrimSpace(os.Getenv(loginLoopbackPortEnv))
+	if rawLoopbackPort != "" {
+		loopbackPort, err = strconv.Atoi(rawLoopbackPort)
+		if err != nil || loopbackPort < 0 || loopbackPort > 65535 {
+			return Credentials{}, authenticationError(
+				"%s must be an integer between 0 and 65535, got %q",
+				loginLoopbackPortEnv,
+				rawLoopbackPort,
+			)
+		}
+	}
+	listenerAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(loopbackPort))
+	listener, err := net.Listen("tcp", listenerAddress)
 	if err != nil {
+		if rawLoopbackPort != "" && loopbackPort != 0 {
+			return Credentials{}, authenticationError(
+				"could not start the login callback listener on %s fixed by %s: %v",
+				listenerAddress,
+				loginLoopbackPortEnv,
+				err,
+			)
+		}
 		return Credentials{}, authenticationError(
 			"could not start the login callback listener: %v",
 			err,

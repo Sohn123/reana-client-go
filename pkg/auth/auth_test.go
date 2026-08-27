@@ -11,12 +11,17 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,6 +58,32 @@ func testManager(t *testing.T, handler roundTripFunc) *Manager {
 		},
 		Now:   func() time.Time { return now },
 		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+}
+
+func managerWithStore(path string, handler roundTripFunc) *Manager {
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	return &Manager{
+		Store: &Store{Path: path},
+		HTTPClient: &http.Client{
+			Transport: handler,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		Now:   func() time.Time { return now },
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}
+}
+
+func expiredCredentials(now time.Time) Credentials {
+	return Credentials{
+		Issuer:               "https://issuer.example.org",
+		ClientID:             "reana-cli",
+		TokenEndpoint:        "https://issuer.example.org/token",
+		AccessToken:          "old.access.token",
+		AccessTokenExpiresAt: now.Add(-time.Hour).Format(time.RFC3339),
+		RefreshToken:         "old-refresh",
 	}
 }
 
@@ -182,6 +213,69 @@ func TestDiscoverRejectsCredentialEndpointRedirect(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "refusing") {
 		t.Fatalf("expected redirect rejection, got %v", err)
+	}
+}
+
+func TestCredentialPostsAreNotReplayedAcrossRedirects(t *testing.T) {
+	targetRequests := atomic.Int32{}
+	target := httptest.NewTLSServer(http.HandlerFunc(
+		func(w http.ResponseWriter, request *http.Request) {
+			targetRequests.Add(1)
+			_, _ = io.ReadAll(request.Body)
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+	defer target.Close()
+	origin := httptest.NewTLSServer(http.HandlerFunc(
+		func(w http.ResponseWriter, request *http.Request) {
+			http.Redirect(w, request, target.URL, http.StatusTemporaryRedirect)
+		},
+	))
+	defer origin.Close()
+	httpClient := origin.Client()
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	manager := &Manager{
+		Store: &Store{
+			Path: filepath.Join(t.TempDir(), "credentials.json"),
+		},
+		HTTPClient: httpClient,
+		Now:        time.Now,
+		Sleep:      func(context.Context, time.Duration) error { return nil },
+	}
+
+	var tokens tokenResponse
+	response, err := manager.postForm(
+		context.Background(),
+		origin.URL,
+		"token refresh",
+		url.Values{"refresh_token": {"secret-refresh"}},
+		&tokens,
+	)
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf(
+			"expected token redirect rejection, got response=%v err=%v",
+			response,
+			err,
+		)
+	}
+	warning := manager.revokeBestEffort(
+		context.Background(),
+		Metadata{
+			CLIClientID:        "reana-cli",
+			RevocationEndpoint: origin.URL,
+		},
+		"secret-refresh",
+	)
+	if !strings.Contains(warning, "redirect") {
+		t.Fatalf("revocation warning = %q", warning)
+	}
+	if targetRequests.Load() != 0 {
+		t.Fatalf(
+			"redirect target received %d credential posts",
+			targetRequests.Load(),
+		)
 	}
 }
 
@@ -318,6 +412,130 @@ func TestBrowserLoginValidatesStateAndUsesPKCE(t *testing.T) {
 	}
 }
 
+func TestBrowserLoginUsesConfiguredLoopbackPort(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+	t.Setenv(loginLoopbackPortEnv, strconv.Itoa(port))
+
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Path {
+			case discoveryPath:
+				return jsonResponse(http.StatusOK, `{
+                "issuer":"https://issuer.example.org",
+                "authorization_endpoint":"https://issuer.example.org/auth",
+                "token_endpoint":"https://issuer.example.org/token",
+                "reana_cli_client_id":"reana-cli"
+            }`), nil
+			case "/token":
+				return jsonResponse(
+					http.StatusOK,
+					`{"access_token":"browser.jwt.token","refresh_token":"refresh","expires_in":3600}`,
+				), nil
+			default:
+				return nil, fmt.Errorf("unexpected request: %s", request.URL)
+			}
+		},
+	)
+	_, err = manager.LoginBrowser(
+		context.Background(),
+		"https://reana.example.org",
+		func(string) {},
+		func(authorizationURL string) error {
+			parsed, parseErr := url.Parse(authorizationURL)
+			if parseErr != nil {
+				return parseErr
+			}
+			redirect, parseErr := url.Parse(parsed.Query().Get("redirect_uri"))
+			if parseErr != nil {
+				return parseErr
+			}
+			if redirect.Port() != strconv.Itoa(port) {
+				return fmt.Errorf(
+					"redirect port = %q, want %d",
+					redirect.Port(),
+					port,
+				)
+			}
+			callback := redirect.String() + "?code=code&state=" +
+				url.QueryEscape(parsed.Query().Get("state"))
+			response, requestErr := http.Get(callback) //nolint:gosec
+			if requestErr == nil {
+				response.Body.Close()
+			}
+			return requestErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBrowserLoginRejectsInvalidConfiguredLoopbackPort(t *testing.T) {
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{
+            "issuer":"https://issuer.example.org",
+            "authorization_endpoint":"https://issuer.example.org/auth",
+            "token_endpoint":"https://issuer.example.org/token",
+            "reana_cli_client_id":"reana-cli"
+        }`), nil
+		},
+	)
+	for _, value := range []string{"not-a-port", "70000", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(loginLoopbackPortEnv, value)
+			_, err := manager.LoginBrowser(
+				context.Background(),
+				"https://reana.example.org",
+				func(string) {},
+				func(string) error { return nil },
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), loginLoopbackPortEnv) {
+				t.Fatalf("invalid port error = %v", err)
+			}
+		})
+	}
+}
+
+func TestBrowserLoginReportsOccupiedConfiguredLoopbackPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	t.Setenv(loginLoopbackPortEnv, strconv.Itoa(port))
+	manager := testManager(
+		t,
+		func(request *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{
+            "issuer":"https://issuer.example.org",
+            "authorization_endpoint":"https://issuer.example.org/auth",
+            "token_endpoint":"https://issuer.example.org/token",
+            "reana_cli_client_id":"reana-cli"
+        }`), nil
+		},
+	)
+
+	_, err = manager.LoginBrowser(
+		context.Background(),
+		"https://reana.example.org",
+		func(string) {},
+		func(string) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), loginLoopbackPortEnv) {
+		t.Fatalf("occupied port error = %v", err)
+	}
+}
+
 func TestAccessTokenRefreshesAndPreservesRotatedRefreshToken(t *testing.T) {
 	manager := testManager(
 		t,
@@ -363,6 +581,221 @@ func TestAccessTokenRefreshesAndPreservesRotatedRefreshToken(t *testing.T) {
 			"refresh token = %q, want preserved token",
 			stored.RefreshToken,
 		)
+	}
+}
+
+func TestConcurrentManagersPerformOneRefresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reana-client.json")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	handler := roundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				close(started)
+				<-release
+			}
+			return jsonResponse(
+				http.StatusOK,
+				`{"access_token":"new.access.token","refresh_token":"new-refresh","expires_in":3600}`,
+			), nil
+		},
+	)
+	first := managerWithStore(path, handler)
+	second := managerWithStore(path, handler)
+	if _, err := first.Store.Put(
+		"https://reana.example.org", expiredCredentials(first.Now()), true,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	results := make(chan error, 2)
+	go func() {
+		_, err := first.AccessToken(
+			context.Background(),
+			"https://reana.example.org",
+		)
+		results <- err
+	}()
+	<-started
+	go func() {
+		_, err := second.AccessToken(
+			context.Background(),
+			"https://reana.example.org",
+		)
+		results <- err
+	}()
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("refresh calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestLoginDuringRefreshPreventsStaleWriteBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reana-client.json")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := roundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			close(started)
+			<-release
+			return jsonResponse(
+				http.StatusOK,
+				`{"access_token":"stale.access.token","refresh_token":"stale-refresh","expires_in":3600}`,
+			), nil
+		},
+	)
+	manager := managerWithStore(path, handler)
+	if _, err := manager.Store.Put(
+		"https://reana.example.org", expiredCredentials(manager.Now()), true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Refresh(
+			context.Background(), "https://reana.example.org", Credentials{},
+		)
+		result <- err
+	}()
+	<-started
+	winner := expiredCredentials(manager.Now())
+	winner.AccessToken = "login.access.token"
+	winner.RefreshToken = "login-refresh"
+	if _, err := manager.Store.Put("https://reana.example.org", winner, true); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-result; err == nil {
+		t.Fatal("stale refresh unexpectedly succeeded")
+	}
+	stored, err := manager.Store.Get("https://reana.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RefreshToken != "login-refresh" {
+		t.Fatalf("refresh token = %q, want login-refresh", stored.RefreshToken)
+	}
+}
+
+func TestLogoutDuringRefreshPreventsCredentialResurrection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reana-client.json")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := roundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			close(started)
+			<-release
+			return jsonResponse(
+				http.StatusOK,
+				`{"access_token":"stale.access.token","refresh_token":"stale-refresh","expires_in":3600}`,
+			), nil
+		},
+	)
+	manager := managerWithStore(path, handler)
+	if _, err := manager.Store.Put(
+		"https://reana.example.org", expiredCredentials(manager.Now()), true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Refresh(
+			context.Background(), "https://reana.example.org", Credentials{},
+		)
+		result <- err
+	}()
+	<-started
+	if _, err := manager.Store.Logout(
+		"https://reana.example.org", func(Credentials) string { return "" },
+	); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-result; err == nil {
+		t.Fatal("stale refresh unexpectedly succeeded")
+	}
+	stored, err := manager.Store.Get("https://reana.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.AccessToken != "" || stored.RefreshToken != "" {
+		t.Fatalf("logout credentials were resurrected: %+v", stored)
+	}
+}
+
+func TestInvalidGrantDoesNotClearNewerCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reana-client.json")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := roundTripFunc(
+		func(request *http.Request) (*http.Response, error) {
+			close(started)
+			<-release
+			return jsonResponse(
+				http.StatusBadRequest,
+				`{"error":"invalid_grant"}`,
+			), nil
+		},
+	)
+	manager := managerWithStore(path, handler)
+	if _, err := manager.Store.Put(
+		"https://reana.example.org", expiredCredentials(manager.Now()), true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Refresh(
+			context.Background(), "https://reana.example.org", Credentials{},
+		)
+		result <- err
+	}()
+	<-started
+	winner := expiredCredentials(manager.Now())
+	winner.AccessToken = "winner.access.token"
+	winner.RefreshToken = "winner-refresh"
+	if _, err := manager.Store.Put("https://reana.example.org", winner, true); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-result; err == nil ||
+		!strings.Contains(err.Error(), "changed") {
+		t.Fatalf("invalid_grant race error = %v", err)
+	}
+	stored, err := manager.Store.Get("https://reana.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RefreshToken != "winner-refresh" {
+		t.Fatalf("newer credentials were cleared: %+v", stored)
+	}
+}
+
+func TestRefreshLockWaitTimesOutPredictably(t *testing.T) {
+	store := &Store{Path: filepath.Join(t.TempDir(), "reana-client.json")}
+	lock, err := store.tryRefreshLock("https://reana.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseLock(lock)
+	started := time.Now()
+	finished, err := store.waitRefreshLock(
+		"https://reana.example.org", 25*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished {
+		t.Fatal("refresh lock wait unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("refresh lock timeout took %s", elapsed)
 	}
 }
 
