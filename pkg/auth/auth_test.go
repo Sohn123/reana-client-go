@@ -1647,6 +1647,50 @@ func TestLoginDeviceReturnsErrorForIncompleteDeviceResponse(t *testing.T) {
 	}
 }
 
+func TestLoginDeviceRejectsUnusablePromptsAndDurations(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{"missing prompt", `{"device_code":"device","expires_in":300}`},
+		{"missing user code", `{"device_code":"device","verification_uri":"https://issuer.example.org/verify","expires_in":300}`},
+		{"insecure prompt", `{"device_code":"device","user_code":"ABCD","verification_uri":"http://issuer.example.org/verify","expires_in":300}`},
+		{"oversized expiry", `{"device_code":"device","verification_uri_complete":"https://issuer.example.org/verify?code=ABCD","expires_in":3601}`},
+		{"negative interval", `{"device_code":"device","user_code":"ABCD","verification_uri":"https://issuer.example.org/verify","expires_in":300,"interval":-1}`},
+		{"oversized interval", `{"device_code":"device","user_code":"ABCD","verification_uri":"https://issuer.example.org/verify","expires_in":300,"interval":3601}`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager := testManager(t, func(request *http.Request) (*http.Response, error) {
+				switch request.URL.Path {
+				case discoveryPath:
+					return jsonResponse(http.StatusOK, `{
+                        "issuer":"https://issuer.example.org",
+                        "authorization_endpoint":"https://issuer.example.org/auth",
+                        "token_endpoint":"https://issuer.example.org/token",
+                        "device_authorization_endpoint":"https://issuer.example.org/device",
+                        "reana_cli_client_id":"reana-cli"
+                    }`), nil
+				case "/device":
+					return jsonResponse(http.StatusOK, testCase.payload), nil
+				default:
+					t.Fatalf("unexpected request: %s", request.URL)
+					return nil, nil
+				}
+			})
+			prompted := false
+			_, err := manager.LoginDevice(
+				context.Background(),
+				"https://reana.example.org",
+				func(DevicePrompt) { prompted = true },
+			)
+			if err == nil || prompted {
+				t.Fatalf("expected controlled rejection before display, got %v", err)
+			}
+		})
+	}
+}
+
 func TestLoginDeviceTerminalPollingErrors(t *testing.T) {
 	cases := []struct {
 		name       string

@@ -18,10 +18,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reanahub/reana-client-go/pkg/auth"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+
+	"reanahub/reana-client-go/pkg/auth"
 )
 
 func TestOpenBrowserReturnsWrappedErrorWhenNoOpenerIsFound(t *testing.T) {
@@ -128,6 +130,9 @@ func TestLoginDeviceCommandCompletesFullFlow(t *testing.T) {
 // first on PATH; the script uses curl to follow the fake IdP's redirect back
 // to the loopback callback, exactly like a real browser would.
 func TestLoginBrowserCommandCompletesFullFlow(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("test supplies a fake xdg-open implementation")
+	}
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl not available")
 	}

@@ -33,6 +33,7 @@ const (
 	defaultScopes       = "openid profile email offline_access"
 	expiryLeeway        = 60 * time.Second
 	refreshLockWait     = 35 * time.Second
+	deviceFlowMax       = time.Hour
 	loopbackCallbackURL = "/callback"
 )
 
@@ -485,13 +486,38 @@ func (m *Manager) LoginDevice(
 			),
 		)
 	}
-	if prompt.DeviceCode == "" || prompt.ExpiresIn <= 0 {
+	if prompt.DeviceCode == "" || prompt.ExpiresIn <= 0 ||
+		prompt.ExpiresIn > int64(deviceFlowMax/time.Second) {
 		return Credentials{}, authenticationError(
 			"device login response did not contain a valid code and expiry",
 		)
 	}
+	promptURL := prompt.VerificationURIComplete
+	if promptURL == "" {
+		promptURL = prompt.VerificationURI
+		if prompt.UserCode == "" {
+			return Credentials{}, authenticationError(
+				"device login response did not contain a usable verification prompt",
+			)
+		}
+	}
+	if err := validateOIDCURL("device verification URI", promptURL, true); err != nil {
+		return Credentials{}, authenticationError(
+			"device login response did not contain a usable verification prompt",
+		)
+	}
 	if prompt.Interval <= 0 {
+		if prompt.Interval < 0 {
+			return Credentials{}, authenticationError(
+				"device login response contained an invalid polling interval",
+			)
+		}
 		prompt.Interval = 5
+	}
+	if prompt.Interval > int64(deviceFlowMax/time.Second) {
+		return Credentials{}, authenticationError(
+			"device login response contained an invalid polling interval",
+		)
 	}
 	display(prompt)
 	deadline := m.Now().Add(time.Duration(prompt.ExpiresIn) * time.Second)
@@ -777,6 +803,43 @@ func (m *Manager) Refresh(
 	if err != nil {
 		return Credentials{}, err
 	}
+	deadline := time.Now().Add(refreshLockWait)
+	var refreshLock *os.File
+	for refreshLock == nil {
+		refreshLock, err = m.Store.tryRefreshLock(normalized)
+		if err != nil {
+			return Credentials{}, err
+		}
+		if refreshLock != nil {
+			break
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return Credentials{}, authenticationError(
+				"timed out waiting for another credential refresh; please retry",
+			)
+		}
+		finished, waitErr := m.Store.waitRefreshLock(
+			normalized,
+			remaining,
+		)
+		if waitErr != nil {
+			return Credentials{}, waitErr
+		}
+		if !finished {
+			return Credentials{}, authenticationError(
+				"timed out waiting for another credential refresh; please retry",
+			)
+		}
+		newCredentials, getErr := m.Store.Get(normalized)
+		if getErr != nil {
+			return Credentials{}, getErr
+		}
+		if accessTokenValid(newCredentials, m.Now()) {
+			return newCredentials, nil
+		}
+	}
+	defer releaseLock(refreshLock)
 	credentials, err = m.Store.Get(normalized)
 	if err != nil {
 		return Credentials{}, err
@@ -792,27 +855,6 @@ func (m *Manager) Refresh(
 	}
 	startedEpoch := credentials.CredentialEpoch
 	refreshToken := credentials.RefreshToken
-	refreshLock, err := m.Store.tryRefreshLock(normalized)
-	if err != nil {
-		return Credentials{}, err
-	}
-	if refreshLock == nil {
-		finished, waitErr := m.Store.waitRefreshLock(
-			normalized,
-			refreshLockWait,
-		)
-		if waitErr != nil {
-			return Credentials{}, waitErr
-		}
-		if finished {
-			newCredentials, getErr := m.Store.Get(normalized)
-			if getErr == nil && accessTokenValid(newCredentials, m.Now()) {
-				return newCredentials, nil
-			}
-		}
-	} else {
-		defer releaseLock(refreshLock)
-	}
 	var tokens tokenResponse
 	response, err := m.postForm(
 		ctx,
