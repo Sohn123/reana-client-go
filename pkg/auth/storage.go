@@ -22,7 +22,11 @@ import (
 )
 
 const (
-	credentialLockTimeout = 30 * time.Second
+	// Logout holds this lock for as long as its own revocation HTTP call
+	// takes (NewHTTPClient's Timeout, also 30s) -- keep a margin here so a
+	// concurrent waiter's patience doesn't expire at the same instant a
+	// slow-but-legitimate revocation finishes.
+	credentialLockTimeout = 35 * time.Second
 	lockPollInterval      = 100 * time.Millisecond
 )
 

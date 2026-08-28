@@ -327,7 +327,7 @@ func TestList(t *testing.T) {
 	}
 }
 
-func TestListReturnsErrorWhenSessionSecretFetchFails(t *testing.T) {
+func TestListDegradesToPlaceholderWhenSessionSecretFetchFails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			switch {
@@ -335,7 +335,7 @@ func TestListReturnsErrorWhenSessionSecretFetchFails(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{
-                "total": 1,
+                "total": 2,
                 "items": [{
                     "created": "2022-07-28T12:04:37",
                     "id": "my_workflow_id",
@@ -350,10 +350,32 @@ func TestListReturnsErrorWhenSessionSecretFetchFails(t *testing.T) {
                     "session_type": "jupyter",
                     "session_uri": "/session1uri",
                     "shared_with": []
+                }, {
+                    "created": "2022-07-28T12:04:37",
+                    "id": "other_workflow_id",
+                    "name": "other_workflow.1",
+                    "progress": {
+                        "finished": {"job_ids": [], "total": 0},
+                        "total": {"job_ids": [], "total": 0}
+                    },
+                    "status": "created",
+                    "user": "user",
+                    "session_status": "created",
+                    "session_type": "jupyter",
+                    "session_uri": "/session2uri",
+                    "shared_with": []
                 }]
             }`))
 			case strings.HasSuffix(r.URL.Path, "/interactive-session-secret"):
-				w.WriteHeader(http.StatusInternalServerError)
+				if strings.Contains(r.URL.Path, "other_workflow") {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(
+					[]byte(`{"path": "/session1uri", "session_secret": "session-secret"}`),
+				)
 			default:
 				t.Errorf("unexpected request to %q", r.URL.Path)
 			}
@@ -364,9 +386,19 @@ func TestListReturnsErrorWhenSessionSecretFetchFails(t *testing.T) {
 	viper.Set("server-url", server.URL)
 	t.Cleanup(viper.Reset)
 
-	_, err := ExecuteCommand(NewRootCmd(), "list", "-t", "1234", "-s")
-	if err == nil {
-		t.Fatal("expected an error when the session secret fetch fails")
+	out, err := ExecuteCommand(NewRootCmd(), "list", "-t", "1234", "-s")
+	if err != nil {
+		t.Fatalf(
+			"list should degrade a single row's secret-fetch failure, not abort: %v",
+			err,
+		)
+	}
+	if !strings.Contains(out, "my_workflow") ||
+		!strings.Contains(out, "other_workflow") {
+		t.Fatalf("expected both workflows in the listing, got %q", out)
+	}
+	if !strings.Contains(out, "(unavailable)") {
+		t.Errorf("expected a placeholder for the failed row, got %q", out)
 	}
 }
 

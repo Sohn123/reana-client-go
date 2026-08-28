@@ -89,7 +89,7 @@ func TestAPIClientRejectsBearerOverNonLoopbackHTTP(t *testing.T) {
 	setServerURL(t, "http://reana.example")
 
 	_, err := ApiClient("jwt")
-	if err == nil || !strings.Contains(err.Error(), "cleartext HTTP") {
+	if err == nil || !strings.Contains(err.Error(), "HTTPS") {
 		t.Fatalf("expected cleartext bearer rejection, got %v", err)
 	}
 }
@@ -290,7 +290,7 @@ func TestStreamingHTTPClientRejectsMissingServerURL(t *testing.T) {
 
 	_, _, err := StreamingHTTPClient()
 	if err == nil ||
-		!strings.Contains(err.Error(), "REANA_SERVER_URL is not set") {
+		!strings.Contains(err.Error(), "REANA server URL is not set") {
 		t.Fatalf("expected missing server URL error, got %v", err)
 	}
 }
@@ -299,7 +299,7 @@ func TestStreamingHTTPClientRejectsCleartextNonLoopback(t *testing.T) {
 	setServerURL(t, "http://reana.example")
 
 	_, _, err := StreamingHTTPClient()
-	if err == nil || !strings.Contains(err.Error(), "cleartext HTTP") {
+	if err == nil || !strings.Contains(err.Error(), "HTTPS") {
 		t.Fatalf("expected cleartext bearer rejection, got %v", err)
 	}
 }

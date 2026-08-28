@@ -274,6 +274,10 @@ func TestUploadWorkflowNameIsEscapedOnce(t *testing.T) {
 		{"analysis#fragment", "/api/workflows/analysis%23fragment/workspace"},
 		{"analysis?query", "/api/workflows/analysis%3Fquery/workspace"},
 		{"analysis%percent", "/api/workflows/analysis%25percent/workspace"},
+		{
+			"../../etc/passwd",
+			"/api/workflows/..%2F..%2Fetc%2Fpasswd/workspace",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.workflow, func(t *testing.T) {

@@ -1001,9 +1001,9 @@ func TestAccessTokenValid(t *testing.T) {
 	}{
 		{"no access token", Credentials{}, false},
 		{
-			"no expiry recorded",
+			"no expiry recorded fails closed and triggers a refresh",
 			Credentials{AccessToken: "a.b.c"},
-			true,
+			false,
 		},
 		{
 			"expired",
@@ -1839,10 +1839,23 @@ func TestLoginBrowserReturnsCallbackError(t *testing.T) {
 				"?error=access_denied&error_description=user+declined&state=" +
 				url.QueryEscape(parsed.Query().Get("state"))
 			response, requestErr := http.Get(callback) //nolint:gosec
-			if requestErr == nil {
-				response.Body.Close()
+			if requestErr != nil {
+				return requestErr
 			}
-			return requestErr
+			defer response.Body.Close()
+			body, readErr := io.ReadAll(response.Body)
+			if readErr != nil {
+				return readErr
+			}
+			if strings.Contains(string(body), "login complete") {
+				t.Error(
+					"callback page must not claim success for an error response",
+				)
+			}
+			if !strings.Contains(string(body), "login failed") {
+				t.Errorf("expected a failure page, got %q", body)
+			}
+			return nil
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "user declined") {

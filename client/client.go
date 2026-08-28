@@ -194,15 +194,13 @@ func AccessToken(ctx context.Context, token string) (string, error) {
 // control-plane responses. It has no whole-request deadline, but bounds the
 // wait for response headers after the body has been transmitted.
 func StreamingHTTPClient() (*http.Client, *url.URL, error) {
-	serverURL := viper.GetString("server-url")
-	u, err := url.Parse(serverURL)
+	normalized, err := auth.NormalizeServerURL(viper.GetString("server-url"))
 	if err != nil {
 		return nil, nil, err
 	}
-	if u.Host == "" {
-		return nil, nil, errors.New(
-			"environment variable REANA_SERVER_URL is not set",
-		)
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return nil, nil, err
 	}
 	if err := validateBearerTransportURL(u); err != nil {
 		return nil, nil, err
@@ -227,15 +225,13 @@ func newAPIClient(
 	boundResponses bool,
 ) (*AuthenticatedClient, error) {
 	// parse REANA server URL
-	serverURL := viper.GetString("server-url")
-	u, err := url.Parse(serverURL)
+	normalized, err := auth.NormalizeServerURL(viper.GetString("server-url"))
 	if err != nil {
 		return nil, err
 	}
-	if u.Host == "" {
-		return nil, errors.New(
-			"environment variable REANA_SERVER_URL is not set",
-		)
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return nil, err
 	}
 	if err := validateBearerTransportURL(u); err != nil {
 		return nil, err
@@ -280,7 +276,7 @@ func newAPIClient(
 	)
 	apiTransport.Consumers["application/zip"] = runtime.ByteStreamConsumer()
 
-	log.Info("Connecting to ", serverURL)
+	log.Info("Connecting to ", normalized)
 
 	return &AuthenticatedClient{
 		API:        New(apiTransport, strfmt.Default),

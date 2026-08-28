@@ -138,9 +138,18 @@ func uploadFileAs(
 		)
 	}
 
-	endpoint := serverURL.ResolveReference(&url.URL{
-		Path: fmt.Sprintf("/api/workflows/%s/workspace", workflow),
-	})
+	// url.PathEscape encodes "/" and other reserved characters within the
+	// workflow name, unlike setting url.URL.Path directly with an
+	// unescaped value -- a workflow name containing ".." could otherwise
+	// retarget ResolveReference's dot-segment resolution outside
+	// /api/workflows/ entirely.
+	reference, err := url.Parse(
+		fmt.Sprintf("/api/workflows/%s/workspace", url.PathEscape(workflow)),
+	)
+	if err != nil {
+		return "", fmt.Errorf("could not build workspace URL: %w", err)
+	}
+	endpoint := serverURL.ResolveReference(reference)
 	query := endpoint.Query()
 	query.Set("file_name", workspaceFileName)
 	endpoint.RawQuery = query.Encode()

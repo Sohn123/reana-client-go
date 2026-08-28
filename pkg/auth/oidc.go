@@ -668,6 +668,14 @@ func (m *Manager) LoginBrowser(
 			default:
 			}
 			writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+			if result.Error != "" {
+				_, _ = io.WriteString(
+					writer,
+					"<html><body><h1>REANA login failed.</h1>"+
+						"<p>You can close this tab and return to the terminal.</p></body></html>",
+				)
+				return
+			}
 			_, _ = io.WriteString(
 				writer,
 				"<html><body><h1>REANA login complete.</h1><p>You can close this tab and return to the terminal.</p></body></html>",
@@ -755,9 +763,8 @@ func accessTokenValid(credentials Credentials, now time.Time) bool {
 	if credentials.AccessToken == "" {
 		return false
 	}
-	if credentials.AccessTokenExpiresAt == "" {
-		return true
-	}
+	// An empty or otherwise unparseable expiry must fail closed (trigger a
+	// refresh) rather than being treated as valid forever.
 	expiresAt, err := time.Parse(time.RFC3339, credentials.AccessTokenExpiresAt)
 	return err == nil && expiresAt.Add(-expiryLeeway).After(now)
 }

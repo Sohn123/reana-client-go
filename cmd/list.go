@@ -385,7 +385,13 @@ func displayListPayload(
 						workflow.Name,
 					)
 					if err != nil {
-						return err
+						log.Debugf(
+							"could not fetch interactive session secret for %q: %v",
+							workflow.Name,
+							err,
+						)
+						value = "(unavailable)"
+						break
 					}
 					value, err = formatter.FormatSessionURI(
 						serverURL,
