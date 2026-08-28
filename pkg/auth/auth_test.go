@@ -1222,6 +1222,75 @@ func TestCredentialsFromTokenRejectsInvalidRefreshLifetime(t *testing.T) {
 	}
 }
 
+func TestStoreTokensPreservesRotatedRefreshTokenWhenResponseIsRejected(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("unexpected request")
+	})
+	invalidLifetime := int64(-1)
+	_, err := manager.storeTokens(
+		"https://reana.example.org",
+		Metadata{
+			Issuer:        "https://issuer.example.org",
+			CLIClientID:   "reana-cli",
+			TokenEndpoint: "https://issuer.example.org/token",
+		},
+		tokenResponse{
+			AccessToken:  "rejected-access",
+			RefreshToken: "rotated-refresh",
+			ExpiresIn:    &invalidLifetime,
+		},
+		"old-refresh",
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "expires_in") {
+		t.Fatalf("invalid token response error = %v", err)
+	}
+	stored, getErr := manager.Store.Get("https://reana.example.org")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.RefreshToken != "rotated-refresh" {
+		t.Fatalf("refresh token = %q, want rotated-refresh", stored.RefreshToken)
+	}
+	if stored.AccessToken != "" {
+		t.Fatalf("rejected access token was stored: %q", stored.AccessToken)
+	}
+}
+
+func TestRefreshPreservesRotatedRefreshTokenWhenResponseIsRejected(t *testing.T) {
+	manager := testManager(t, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{
+            "access_token":"rejected-access",
+            "refresh_token":"rotated-refresh",
+            "expires_in":-1
+        }`), nil
+	})
+	serverURL := "https://reana.example.org"
+	credentials, err := manager.Store.Put(
+		serverURL,
+		expiredCredentials(manager.Now()),
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.Refresh(context.Background(), serverURL, credentials)
+	if err == nil || !strings.Contains(err.Error(), "expires_in") {
+		t.Fatalf("invalid token response error = %v", err)
+	}
+	stored, getErr := manager.Store.Get(serverURL)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.RefreshToken != "rotated-refresh" {
+		t.Fatalf("refresh token = %q, want rotated-refresh", stored.RefreshToken)
+	}
+	if stored.AccessToken != "" {
+		t.Fatalf("rejected access token was stored: %q", stored.AccessToken)
+	}
+}
+
 func TestAccessTokenReturnsCachedTokenWithoutRefreshing(t *testing.T) {
 	called := false
 	manager := testManager(t, func(*http.Request) (*http.Response, error) {

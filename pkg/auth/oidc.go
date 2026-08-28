@@ -409,6 +409,21 @@ func credentialsFromToken(
 	return credentials, nil
 }
 
+func refreshTokenRecoveryCredentials(
+	metadata Metadata,
+	refreshToken string,
+) Credentials {
+	return Credentials{
+		Issuer:                      metadata.Issuer,
+		ClientID:                    metadata.CLIClientID,
+		TokenEndpoint:               metadata.TokenEndpoint,
+		AuthorizationEndpoint:       metadata.AuthorizationEndpoint,
+		DeviceAuthorizationEndpoint: metadata.DeviceAuthorizationEndpoint,
+		RevocationEndpoint:          metadata.RevocationEndpoint,
+		RefreshToken:                refreshToken,
+	}
+}
+
 func metadataFromCredentials(credentials Credentials) Metadata {
 	return Metadata{
 		Issuer:                      credentials.Issuer,
@@ -434,6 +449,23 @@ func (m *Manager) storeTokens(
 		m.Now(),
 	)
 	if err != nil {
+		if tokens.RefreshToken != "" && tokens.RefreshToken != oldRefreshToken {
+			// The issuer may rotate the refresh token before we reject another
+			// response field. Preserve only that replacement, without accepting
+			// the invalid access token, so the next command can retry safely.
+			_, storeErr := m.Store.Put(
+				serverURL,
+				refreshTokenRecoveryCredentials(metadata, tokens.RefreshToken),
+				makeActive,
+			)
+			if storeErr != nil {
+				return Credentials{}, authenticationError(
+					"%v; could not preserve rotated refresh token: %v",
+					err,
+					storeErr,
+				)
+			}
+		}
 		return Credentials{}, err
 	}
 	return m.Store.Put(serverURL, credentials, makeActive)
@@ -908,6 +940,36 @@ func (m *Manager) Refresh(
 		m.Now(),
 	)
 	if err != nil {
+		if tokens.RefreshToken != "" && tokens.RefreshToken != refreshToken {
+			recovery := refreshTokenRecoveryCredentials(
+				metadata,
+				tokens.RefreshToken,
+			)
+			_, matched, storeErr := m.Store.PutIfEpoch(
+				normalized,
+				recovery,
+				startedEpoch,
+			)
+			if storeErr != nil {
+				return Credentials{}, authenticationError(
+					"%v; could not preserve rotated refresh token: %v",
+					err,
+					storeErr,
+				)
+			}
+			if !matched {
+				revokeContext, cancel := context.WithTimeout(
+					context.Background(),
+					30*time.Second,
+				)
+				defer cancel()
+				m.revokeBestEffort(
+					revokeContext,
+					metadata,
+					tokens.RefreshToken,
+				)
+			}
+		}
 		return Credentials{}, err
 	}
 	stored, matched, err := m.Store.PutIfEpoch(
